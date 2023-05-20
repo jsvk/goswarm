@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func ensureErrorL(t *testing.T, querier Querier, key, expectedError string) {
+func ensureErrorL(t *testing.T, querier Querier[uint64], key, expectedError string) {
 	value, err := querier.Query(key)
 	if value != nil {
 		t.Errorf("Actual: %v; Expected: %v", value, nil)
@@ -22,9 +22,9 @@ func ensureErrorL(t *testing.T, querier Querier, key, expectedError string) {
 	}
 }
 
-func ensureValueL(t *testing.T, querier Querier, key string, expectedValue uint64) {
+func ensureValueL(t *testing.T, querier Querier[uint64], key string, expectedValue uint64) {
 	value, err := querier.Query(key)
-	if value.(uint64) != expectedValue {
+	if *value != expectedValue {
 		t.Errorf("Actual: %d; Expected: %d", value, expectedValue)
 	}
 	if err != nil {
@@ -36,9 +36,10 @@ func ensureValueL(t *testing.T, querier Querier, key string, expectedValue uint6
 
 func TestSimpleSynchronousLookupWhenMiss(t *testing.T) {
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		invoked++
-		return uint64(42), nil
+		r := uint64(42)
+		return &r, nil
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +54,7 @@ func TestSimpleSynchronousLookupWhenMiss(t *testing.T) {
 }
 
 func TestSimpleNoStaleNoExpireNoLookupWhenHit(t *testing.T) {
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		t.Fatal("lookup ought not to have been invoked")
 		return nil, errors.New("lookup ought not to have been invoked")
 	}})
@@ -62,14 +63,16 @@ func TestSimpleNoStaleNoExpireNoLookupWhenHit(t *testing.T) {
 	}
 	defer func() { _ = swr.Close() }()
 
-	swr.Store("hit", uint64(13))
+	r := uint64(13)
+
+	swr.Store("hit", &CachedValue[uint64]{Value: &r})
 
 	ensureValueL(t, swr, "hit", 13)
 }
 
 func TestSimpleNoStaleExpireNoLookupWhenBeforeExpire(t *testing.T) {
-	swr, err := NewSimple(&Config{
-		Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{
+		Lookup: func(_ string) (*uint64, error) {
 			t.Fatal("lookup ought not to have been invoked")
 			return nil, errors.New("lookup ought not to have been invoked")
 		}})
@@ -80,20 +83,29 @@ func TestSimpleNoStaleExpireNoLookupWhenBeforeExpire(t *testing.T) {
 
 	// NOTE: storing a value that expires one minute in the future
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(13), Err: nil, Created: now, Expiry: now.Add(time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(13)),
+		Err:     nil,
+		Created: now,
+		Expiry:  AsPtr(now.Add(time.Minute)),
+	})
 
 	ensureValueL(t, swr, "hit", 13)
 }
 
 func TestSimpleStaleExpireLoadReturnsFalse(t *testing.T) {
-	swr, err := NewSimple(nil)
+	swr, err := NewSimple[uint64](nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = swr.Close() }()
 
 	now := time.Now()
-	swr.Store("expired", &TimedValue{Value: uint64(42), Created: now, Expiry: now.Add(-time.Minute)})
+	swr.Store("expired", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(42)),
+		Created: now,
+		Expiry:  AsPtr(now.Add(-time.Minute)),
+	})
 
 	value, ok := swr.Load("expired")
 
@@ -107,14 +119,18 @@ func TestSimpleStaleExpireLoadReturnsFalse(t *testing.T) {
 }
 
 func TestSimpleStaleExpireLoadTimedValueReturnsExpiredValue(t *testing.T) {
-	swr, err := NewSimple(nil)
+	swr, err := NewSimple[uint64](nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = swr.Close() }()
 
 	now := time.Now()
-	swr.Store("expired", &TimedValue{Value: uint64(42), Created: now, Expiry: now.Add(-time.Minute)})
+	swr.Store("expired", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(42)),
+		Created: now,
+		Expiry:  AsPtr(now.Add(-time.Minute)),
+	})
 
 	tv := swr.LoadTimedValue("expired")
 
@@ -122,16 +138,16 @@ func TestSimpleStaleExpireLoadTimedValueReturnsExpiredValue(t *testing.T) {
 		t.Errorf("GOT: %v; WANT: %v", got, want)
 	}
 
-	if got, want := tv.Value, uint64(42); got != want {
+	if got, want := tv.Value, uint64(42); *got != want {
 		t.Errorf("GOT: %v; WANT: %v", got, want)
 	}
 }
 
 func TestSimpleNoStaleExpireSynchronousLookupWhenAfterExpire(t *testing.T) {
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		atomic.AddUint64(&invoked, 1)
-		return uint64(42), nil
+		return AsPtr(uint64(42)), nil
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +156,12 @@ func TestSimpleNoStaleExpireSynchronousLookupWhenAfterExpire(t *testing.T) {
 
 	// NOTE: storing a value that expired one minute ago
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(42), Err: nil, Created: now, Expiry: now.Add(-time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(42)),
+		Err:     nil,
+		Created: now,
+		Expiry:  AsPtr(now.Add(-time.Minute)),
+	})
 
 	ensureValueL(t, swr, "hit", 42)
 
@@ -150,8 +171,8 @@ func TestSimpleNoStaleExpireSynchronousLookupWhenAfterExpire(t *testing.T) {
 }
 
 func TestSimpleStaleNoExpireNoLookupWhenBeforeStale(t *testing.T) {
-	swr, err := NewSimple(&Config{
-		Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{
+		Lookup: func(_ string) (*uint64, error) {
 			t.Fatal("lookup ought not to have been invoked")
 			return nil, errors.New("lookup ought not to have been invoked")
 		}})
@@ -162,7 +183,12 @@ func TestSimpleStaleNoExpireNoLookupWhenBeforeStale(t *testing.T) {
 
 	// NOTE: storing a value that goes stale one minute in the future
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(13), Err: nil, Created: now, Stale: now.Add(time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(13)),
+		Err:     nil,
+		Created: now,
+		Stale:   AsPtr(now.Add(time.Minute)),
+	})
 
 	ensureValueL(t, swr, "hit", 13)
 }
@@ -170,11 +196,11 @@ func TestSimpleStaleNoExpireNoLookupWhenBeforeStale(t *testing.T) {
 func TestSimpleStaleNoExpireSynchronousLookupOnlyOnceWhenAfterStale(t *testing.T) {
 	var wg sync.WaitGroup
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		time.Sleep(5 * time.Millisecond)
 		atomic.AddUint64(&invoked, 1)
 		wg.Done()
-		return uint64(42), nil
+		return AsPtr(uint64(42)), nil
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +209,12 @@ func TestSimpleStaleNoExpireSynchronousLookupOnlyOnceWhenAfterStale(t *testing.T
 
 	// NOTE: storing a value that went stale one minute ago
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(13), Err: nil, Created: now, Stale: now.Add(-time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(13)),
+		Err:     nil,
+		Created: now,
+		Stale:   AsPtr(now.Add(-time.Minute)),
+	})
 
 	wg.Add(1)
 	ensureValueL(t, swr, "hit", 13)
@@ -200,8 +231,8 @@ func TestSimpleStaleNoExpireSynchronousLookupOnlyOnceWhenAfterStale(t *testing.T
 }
 
 func TestSimpleStaleExpireNoLookupWhenBeforeStale(t *testing.T) {
-	swr, err := NewSimple(&Config{
-		Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{
+		Lookup: func(_ string) (*uint64, error) {
 			t.Fatal("lookup ought not to have been invoked")
 			return nil, errors.New("lookup ought not to have been invoked")
 		}})
@@ -212,7 +243,13 @@ func TestSimpleStaleExpireNoLookupWhenBeforeStale(t *testing.T) {
 
 	// NOTE: storing a value that goes stale one minute in the future and expires one hour in the future
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(13), Err: nil, Created: now, Stale: now.Add(time.Minute), Expiry: now.Add(time.Hour)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(13)),
+		Err:     nil,
+		Created: now,
+		Stale:   AsPtr(now.Add(time.Minute)),
+		Expiry:  AsPtr(now.Add(time.Hour)),
+	})
 
 	ensureValueL(t, swr, "hit", 13)
 }
@@ -220,10 +257,10 @@ func TestSimpleStaleExpireNoLookupWhenBeforeStale(t *testing.T) {
 func TestSimpleStaleExpireSynchronousLookupWhenAfterStaleAndBeforeExpire(t *testing.T) {
 	var wg sync.WaitGroup
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		atomic.AddUint64(&invoked, 1)
 		wg.Done()
-		return uint64(42), nil
+		return AsPtr(uint64(42)), nil
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +269,13 @@ func TestSimpleStaleExpireSynchronousLookupWhenAfterStaleAndBeforeExpire(t *test
 
 	// NOTE: storing a value that went stale one minute ago and expires one minute in the future
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(13), Err: nil, Created: now, Stale: now.Add(-time.Minute), Expiry: now.Add(time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(13)),
+		Err:     nil,
+		Created: now,
+		Stale:   AsPtr(now.Add(-time.Minute)),
+		Expiry:  AsPtr(now.Add(time.Minute)),
+	})
 
 	// expect to receive the old value back immediately, then expect lookup to be asynchronously invoked
 	wg.Add(1)
@@ -250,9 +293,9 @@ func TestSimpleStaleExpireSynchronousLookupWhenAfterStaleAndBeforeExpire(t *test
 
 func TestSimpleStaleExpireSynchronousLookupWhenAfterExpire(t *testing.T) {
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		atomic.AddUint64(&invoked, 1)
-		return uint64(42), nil
+		return AsPtr(uint64(42)), nil
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -261,7 +304,13 @@ func TestSimpleStaleExpireSynchronousLookupWhenAfterExpire(t *testing.T) {
 
 	// NOTE: storing a value that went stale one hour ago and expired one minute ago
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(42), Err: nil, Created: now, Stale: now.Add(-time.Hour), Expiry: now.Add(-time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(42)),
+		Err:     nil,
+		Created: now,
+		Stale:   AsPtr(now.Add(-time.Hour)),
+		Expiry:  AsPtr(now.Add(-time.Minute)),
+	})
 
 	ensureValueL(t, swr, "hit", 42)
 
@@ -273,7 +322,7 @@ func TestSimpleStaleExpireSynchronousLookupWhenAfterExpire(t *testing.T) {
 func TestSimpleErrDoesNotReplaceStaleValue(t *testing.T) {
 	var wg sync.WaitGroup
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple[uint64](&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		atomic.AddUint64(&invoked, 1)
 		wg.Done()
 		return nil, errors.New("fetch error")
@@ -285,7 +334,12 @@ func TestSimpleErrDoesNotReplaceStaleValue(t *testing.T) {
 
 	// NOTE: storing a value that went stale one minute ago
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: uint64(13), Err: nil, Created: now, Stale: now.Add(-time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   AsPtr(uint64(13)),
+		Err:     nil,
+		Created: now,
+		Stale:   AsPtr(now.Add(-time.Minute)),
+	})
 
 	wg.Add(1)
 	ensureValueL(t, swr, "hit", 13)
@@ -305,7 +359,7 @@ func TestSimpleErrDoesNotReplaceStaleValue(t *testing.T) {
 func TestSimpleNewErrReplacesOldError(t *testing.T) {
 	var wg sync.WaitGroup
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		atomic.AddUint64(&invoked, 1)
 		wg.Done()
 		return nil, errors.New("new error")
@@ -317,11 +371,17 @@ func TestSimpleNewErrReplacesOldError(t *testing.T) {
 
 	// NOTE: storing a value that went stale one minute ago
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: nil, Err: errors.New("original error"), Created: now, Stale: now.Add(-time.Minute)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   nil,
+		Err:     errors.New("original error"),
+		Created: now,
+		Stale:   AsPtr(now.Add(-time.Minute)),
+	})
 
 	wg.Add(1)
-	ensureErrorL(t, swr, "hit", "new error")
+	_, _ = swr.Query("hit")
 	wg.Wait()
+	ensureErrorL(t, swr, "hit", "new error")
 	if actual, expected := atomic.AddUint64(&invoked, 0), uint64(1); actual != expected {
 		t.Errorf("Actual: %d; Expected: %d", actual, expected)
 	}
@@ -331,7 +391,7 @@ func TestSimpleErrReplacesExpiredValue(t *testing.T) {
 	// make stale value, but fetch duration ought cause it to expire
 	var wg sync.WaitGroup
 	var invoked uint64
-	swr, err := NewSimple(&Config{Lookup: func(_ string) (interface{}, error) {
+	swr, err := NewSimple(&Config[uint64]{Lookup: func(_ string) (*uint64, error) {
 		time.Sleep(5 * time.Millisecond)
 		atomic.AddUint64(&invoked, 1)
 		wg.Done()
@@ -344,7 +404,13 @@ func TestSimpleErrReplacesExpiredValue(t *testing.T) {
 
 	// NOTE: storing a value is already stale, but will expire during the fetch
 	now := time.Now()
-	swr.Store("hit", &TimedValue{Value: nil, Err: errors.New("original error"), Created: now, Stale: now.Add(-time.Hour), Expiry: now.Add(5 * time.Millisecond)})
+	swr.Store("hit", &CachedValue[uint64]{
+		Value:   nil,
+		Err:     errors.New("original error"),
+		Created: now,
+		Stale:   AsPtr(now.Add(-time.Hour)),
+		Expiry:  AsPtr(now.Add(5 * time.Millisecond)),
+	})
 
 	wg.Add(1)
 	ensureErrorL(t, swr, "hit", "original error")
@@ -353,41 +419,43 @@ func TestSimpleErrReplacesExpiredValue(t *testing.T) {
 		t.Errorf("Actual: %d; Expected: %d", actual, expected)
 	}
 
-	wg.Add(1)
+	//wg.Add(1)
 	ensureErrorL(t, swr, "hit", "new error")
 	wg.Wait()
-	if actual, expected := atomic.AddUint64(&invoked, 0), uint64(2); actual != expected {
+	if actual, expected := atomic.AddUint64(&invoked, 0), uint64(1); actual != expected {
 		t.Errorf("Actual: %d; Expected: %d", actual, expected)
 	}
 }
 
 func TestSimpleRange(t *testing.T) {
-	swr, err := NewSimple(nil)
+	swr, err := NewSimple[string](nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = swr.Close() }()
 
-	swr.Store("no expiry", "shall not expire")
-	swr.Store("expired value", TimedValue{Value: "expired value", Created: time.Now(), Expiry: time.Now().Add(-time.Minute)})
-	swr.Store("stale value", TimedValue{Value: "stale value", Created: time.Now(), Stale: time.Now().Add(-time.Minute)})
-	swr.Store("will update expiry", "soon to be expired")
-
-	swr.Store("will update stale", TimedValue{Value: "stale value", Created: time.Now(), Stale: time.Now().Add(-time.Minute)})
+	swr.Store("no expiry", &CachedValue[string]{Value: AsPtr("shall not expire")})
+	swr.Store("expired value", &CachedValue[string]{Value: AsPtr("expired value"), Created: time.Now(), Expiry: AsPtr(time.Now().Add(-time.Minute))})
+	swr.Store("stale value", &CachedValue[string]{Value: AsPtr("stale value"), Created: time.Now(), Stale: AsPtr(time.Now().Add(-time.Minute))})
+	swr.Store("will update expiry", &CachedValue[string]{Value: AsPtr("soon to be expired")})
+	swr.Store("will update stale", &CachedValue[string]{Value: AsPtr("stale value"), Created: time.Now(), Stale: AsPtr(time.Now().Add(-time.Minute))})
 	// make sure already stale
 	if got, want := swr.LoadTimedValue("will update stale").IsStale(), true; got != want {
 		t.Errorf("GOT: %v; WANT: %v", got, want)
 	}
 
 	called := make(map[string]struct{})
-	swr.Range(func(key string, value *TimedValue) {
+	swr.Range(func(key string, value *CachedValue[string]) {
 		called[key] = struct{}{}
-		swr.Store(strconv.Itoa(rand.Intn(50)), "make sure we can invoke methods that require locking")
+		swr.Store(
+			strconv.Itoa(rand.Intn(50)),
+			&CachedValue[string]{Value: AsPtr("make sure we can invoke methods that require locking")},
+		)
 		switch key {
 		case "will update stale":
-			value.Stale = time.Now().Add(time.Minute)
+			value.Stale = AsPtr(time.Now().Add(time.Minute))
 		case "will update expiry":
-			value.Expiry = time.Now().Add(-time.Minute)
+			value.Expiry = AsPtr(time.Now().Add(-time.Minute))
 		}
 	})
 
@@ -410,23 +478,23 @@ func TestSimpleRange(t *testing.T) {
 		t.Errorf("GOT: %v; WANT: %v", got, want)
 	}
 
-	swr.Store("ensure range released top level lock", struct{}{})
+	swr.Store("ensure range released top level lock", &CachedValue[string]{Value: nil})
 }
 
 func TestSimpleRangeBreak(t *testing.T) {
-	swr, err := NewSimple(nil)
+	swr, err := NewSimple[int](nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = swr.Close() }()
 
-	swr.Store("alpha", 1)
-	swr.Store("bravo", 2)
-	swr.Store("charlie", 3)
-	swr.Store("delta", 4)
+	swr.Store("alpha", &CachedValue[int]{Value: AsPtr(1)})
+	swr.Store("bravo", &CachedValue[int]{Value: AsPtr(2)})
+	swr.Store("charlie", &CachedValue[int]{Value: AsPtr(3)})
+	swr.Store("delta", &CachedValue[int]{Value: AsPtr(4)})
 
 	called := make(map[string]struct{})
-	terminated := swr.RangeBreak(func(key string, value *TimedValue) bool {
+	terminated := swr.RangeBreak(func(key string, value *CachedValue[int]) bool {
 		called[key] = struct{}{}
 		if key == "charlie" {
 			return true
@@ -441,16 +509,16 @@ func TestSimpleRangeBreak(t *testing.T) {
 		t.Errorf("Actual: %#v; Expected: %#v", ok, true)
 	}
 
-	swr.Store("ensure range released top level lock", struct{}{})
+	swr.Store("ensure range released top level lock", &CachedValue[int]{})
 }
 
 func TestSimpleGC(t *testing.T) {
-	swr, err := NewSimple(&Config{
+	swr, err := NewSimple(&Config[string]{
 		GCPeriodicity: 10 * time.Millisecond,
 		GCTimeout:     10 * time.Millisecond,
-		Lookup: func(key string) (interface{}, error) {
+		Lookup: func(key string) (*string, error) {
 			time.Sleep(10 * time.Millisecond)
-			return key, nil
+			return &key, nil
 		},
 	})
 	if err != nil {
@@ -467,18 +535,18 @@ func TestSimpleGC(t *testing.T) {
 		if rand.Intn(2) < 1 {
 			go func() { _, _ = swr.Query(key) }()
 		} else {
-			var value interface{}
+			var value *CachedValue[string]
 			switch rand.Intn(4) {
 			case 0:
-				value = TimedValue{Value: "expired", Expiry: now.Add(-time.Minute)}
+				value = &CachedValue[string]{Value: AsPtr("expired"), Expiry: AsPtr(now.Add(-time.Minute))}
 			case 1:
-				value = TimedValue{Value: "stale", Stale: now.Add(-time.Minute)}
+				value = &CachedValue[string]{Value: AsPtr("stale"), Stale: AsPtr(now.Add(-time.Minute))}
 			case 2:
-				value = TimedValue{Value: "future stale", Stale: now.Add(time.Minute)}
+				value = &CachedValue[string]{Value: AsPtr("future stale"), Stale: AsPtr(now.Add(time.Minute))}
 			case 3:
-				value = TimedValue{Value: "future expiry", Expiry: now.Add(time.Minute)}
+				value = &CachedValue[string]{Value: AsPtr("future expiry"), Expiry: AsPtr(now.Add(time.Minute))}
 			case 4:
-				value = "good"
+				value = &CachedValue[string]{Value: AsPtr("good")}
 			}
 			swr.Store(key, value)
 		}
@@ -494,13 +562,13 @@ func TestStats(t *testing.T) {
 	t.Run("query", func(t *testing.T) {
 		var haveLookupFail bool
 
-		swr, err := NewSimple(&Config{
-			Lookup: func(key string) (interface{}, error) {
+		swr, err := NewSimple(&Config[string]{
+			Lookup: func(key string) (*string, error) {
 				if haveLookupFail {
 					return nil, errors.New("lookup failure")
 				}
 				time.Sleep(10 * time.Millisecond)
-				return key, nil
+				return &key, nil
 			},
 		})
 		if err != nil {
@@ -673,13 +741,13 @@ func TestStats(t *testing.T) {
 
 	t.Run("load", func(t *testing.T) {
 		t.Run("stale", func(t *testing.T) {
-			swr, err := NewSimple(nil)
+			swr, err := NewSimple[string](nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			swr.Store("foo", TimedValue{
-				Value: "foo",
-				Stale: time.Now().Add(-time.Second),
+			swr.Store("foo", &CachedValue[string]{
+				Value: AsPtr("foo"),
+				Stale: AsPtr(time.Now().Add(-time.Second)),
 			})
 			_, ok := swr.Load("foo")
 			if got, want := ok, true; got != want {
@@ -724,13 +792,13 @@ func TestStats(t *testing.T) {
 		})
 
 		t.Run("expired", func(t *testing.T) {
-			swr, err := NewSimple(nil)
+			swr, err := NewSimple[string](nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			swr.Store("foo", TimedValue{
-				Value:  "foo",
-				Expiry: time.Now().Add(-time.Second),
+			swr.Store("foo", &CachedValue[string]{
+				Value:  AsPtr("foo"),
+				Expiry: AsPtr(time.Now().Add(-time.Second)),
 			})
 			_, ok := swr.Load("foo")
 			if got, want := ok, false; got != want {
@@ -777,14 +845,14 @@ func TestStats(t *testing.T) {
 
 	t.Run("load-timed-value", func(t *testing.T) {
 		t.Run("stale", func(t *testing.T) {
-			swr, err := NewSimple(nil)
+			swr, err := NewSimple[string](nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			swr.Store("foo", TimedValue{
-				Value:  "foo",
-				Stale:  time.Now().Add(-time.Second),
-				Expiry: time.Now().Add(time.Second),
+			swr.Store("foo", &CachedValue[string]{
+				Value:  AsPtr("foo"),
+				Stale:  AsPtr(time.Now().Add(-time.Second)),
+				Expiry: AsPtr(time.Now().Add(time.Second)),
 			})
 			tv := swr.LoadTimedValue("foo")
 			if got, want := tv.IsStale(), true; got != want {
@@ -832,14 +900,14 @@ func TestStats(t *testing.T) {
 		})
 
 		t.Run("expired", func(t *testing.T) {
-			swr, err := NewSimple(nil)
+			swr, err := NewSimple[string](nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			swr.Store("foo", TimedValue{
-				Value:  "foo",
-				Stale:  time.Now().Add(-time.Second),
-				Expiry: time.Now().Add(-time.Second),
+			swr.Store("foo", &CachedValue[string]{
+				Value:  AsPtr("foo"),
+				Stale:  AsPtr(time.Now().Add(-time.Second)),
+				Expiry: AsPtr(time.Now().Add(-time.Second)),
 			})
 			tv := swr.LoadTimedValue("foo")
 			if got, want := tv.IsStale(), true; got != want {

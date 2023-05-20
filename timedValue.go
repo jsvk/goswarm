@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// TimedValueStatus is an enumeration of the states of a TimedValue: Fresh,
+// TimedValueStatus is an enumeration of the states of a CachedValue: Fresh,
 // Stale, or Expired.
 type TimedValueStatus int
 
@@ -26,11 +26,11 @@ const (
 	Expired
 )
 
-// TimedValue couples a value or the error with both a stale and expiry time for
+// CachedValue couples a value or the error with both a stale and expiry time for
 // the value and error.
-type TimedValue struct {
+type CachedValue[T any] struct {
 	// Value stores the datum returned by the lookup function.
-	Value interface{}
+	Value *T
 
 	// Err stores the error returned by the lookup function.
 	Err error
@@ -40,13 +40,13 @@ type TimedValue struct {
 	// original value is returned. A zero-value for Stale implies the value
 	// never goes stale, and querying the key associated for this value will
 	// never trigger an asynchronous lookup of a replacement value.
-	Stale time.Time
+	Stale *time.Time
 
 	// Expiry stores the time at which the value expires. On Query, an expired
 	// value will block until a synchronous lookup of a replacement value is
 	// attempted. Once the lookup returns, the Query method will return with the
 	// new value or the error returned by the lookup function.
-	Expiry time.Time
+	Expiry *time.Time
 
 	// Created stores the time at which the value was created.
 	Created time.Time
@@ -57,7 +57,7 @@ type TimedValue struct {
 // A value is expired when its non-zero expiry time is before the current time,
 // or when the value represents an error and expiry time is the time.Time
 // zero-value.
-func (tv *TimedValue) IsExpired() bool {
+func (tv *CachedValue[T]) IsExpired() bool {
 	return tv.IsExpiredAt(time.Now())
 }
 
@@ -66,13 +66,16 @@ func (tv *TimedValue) IsExpired() bool {
 // A value is expired when its non-zero expiry time is before the specified
 // time, or when the value represents an error and expiry time is the time.Time
 // zero-value.
-func (tv *TimedValue) IsExpiredAt(when time.Time) bool {
-	if tv.Err == nil {
-		return !tv.Expiry.IsZero() && when.After(tv.Expiry)
+func (tv *CachedValue[T]) IsExpiredAt(when time.Time) bool {
+	if tv.Expiry == nil {
+		return false
 	}
-	// NOTE: When a TimedValue stores an error result, then a zero-value for the
+	if tv.Err == nil {
+		return !tv.Expiry.IsZero() && when.After(*tv.Expiry)
+	}
+	// NOTE: When a CachedValue stores an error result, then a zero-value for the
 	// Expiry imply the value is immediately expired.
-	return tv.Expiry.IsZero() || when.After(tv.Expiry)
+	return tv.Expiry.IsZero() || when.After(*tv.Expiry)
 }
 
 // IsStale returns true when the value is stale.
@@ -80,7 +83,7 @@ func (tv *TimedValue) IsExpiredAt(when time.Time) bool {
 // A value is stale when its non-zero stale time is before the current time, or
 // when the value represents an error and stale time is the time.Time
 // zero-value.
-func (tv *TimedValue) IsStale() bool {
+func (tv *CachedValue[T]) IsStale() bool {
 	return tv.IsStaleAt(time.Now())
 }
 
@@ -89,24 +92,27 @@ func (tv *TimedValue) IsStale() bool {
 // A value is stale when its non-zero stale time is before the specified time,
 // or when the value represents an error and stale time is the time.Time
 // zero-value.
-func (tv *TimedValue) IsStaleAt(when time.Time) bool {
-	if tv.Err == nil {
-		return !tv.Stale.IsZero() && when.After(tv.Stale)
+func (tv *CachedValue[T]) IsStaleAt(when time.Time) bool {
+	if tv.Stale == nil {
+		return false
 	}
-	// NOTE: When a TimedValue stores an error result, then a zero-value for the
+	if tv.Err == nil {
+		return !tv.Stale.IsZero() && when.After(*tv.Stale)
+	}
+	// NOTE: When a CachedValue stores an error result, then a zero-value for the
 	// Stale or Expiry imply the value is immediately stale.
-	return tv.Stale.IsZero() || when.After(tv.Stale)
+	return tv.Stale.IsZero() || when.After(*tv.Stale)
 }
 
 // Status returns Fresh, Stale, or Exired, depending on the status of the
-// TimedValue item at the current time.
-func (tv *TimedValue) Status() TimedValueStatus {
+// CachedValue item at the current time.
+func (tv *CachedValue[T]) Status() TimedValueStatus {
 	return tv.StatusAt(time.Now())
 }
 
-// StatusAt returns Fresh, Stale, or Exired, depending on the status of the
-// TimedValue item at the specified time.
-func (tv *TimedValue) StatusAt(when time.Time) TimedValueStatus {
+// StatusAt returns Fresh, Stale, or Expired, depending on the status of the
+// CachedValue item at the specified time.
+func (tv *CachedValue[T]) StatusAt(when time.Time) TimedValueStatus {
 	if tv.IsExpiredAt(when) {
 		return Expired
 	}
@@ -116,38 +122,32 @@ func (tv *TimedValue) StatusAt(when time.Time) TimedValueStatus {
 	return Fresh
 }
 
-// helper function to wrap non TimedValue items as TimedValue items.
-func newTimedValue(value interface{}, err error, staleDuration, expiryDuration time.Duration) *TimedValue {
-	switch val := value.(type) {
-	case TimedValue:
-		if val.Created.IsZero() {
-			val.Created = time.Now()
-		}
-		return &val
-	case *TimedValue:
-		if val.Created.IsZero() {
-			val.Created = time.Now()
-		}
-		return val
-	default:
-		if staleDuration == 0 && expiryDuration == 0 {
-			return &TimedValue{Value: value, Err: err, Created: time.Now()}
-		}
-		var stale, expiry time.Time
-		now := time.Now()
-		if staleDuration > 0 {
-			stale = now.Add(staleDuration)
-		}
-		if expiryDuration > 0 {
-			expiry = now.Add(expiryDuration)
-		}
-		return &TimedValue{Value: value, Err: err, Created: time.Now(), Stale: stale, Expiry: expiry}
+func AsPtr[T any](t T) *T {
+	return &t
+}
+
+// helper function to wrap non CachedValue items as CachedValue items.
+func newCachedValue[T any](value *T, err error, staleDuration, expiryDuration *time.Duration) *CachedValue[T] {
+	var stale, expiry *time.Time
+	now := time.Now()
+	if staleDuration != nil && *staleDuration > 0 {
+		stale = AsPtr(now.Add(*staleDuration))
+	}
+	if expiryDuration != nil && *expiryDuration > 0 {
+		expiry = AsPtr(now.Add(*expiryDuration))
+	}
+	return &CachedValue[T]{
+		Value:   value,
+		Err:     err,
+		Created: time.Now(),
+		Stale:   stale,
+		Expiry:  expiry,
 	}
 }
 
 type atomicTimedValue struct {
 	// av is accessed with atomic.Value's Load() and Store() methods to
-	// atomically access the underlying *TimedValue.
+	// atomically access the underlying *CachedValue.
 	av atomic.Value
 
 	// pending is accessed with sync/atomic primitives to control whether an
